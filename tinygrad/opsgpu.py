@@ -9,11 +9,14 @@ def buffer_new(ctx, shape):
   res_g.dtype = np.float32
   return res_g
 
-def buffer_zeros(ctx, shape):
-  res_g = cl.Buffer(ctx.cl_ctx, cl.mem_flags.WRITE_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=np.zeros(shape))
-  res_g.shape = shape
-  res_g.dtype = np.float32
+def buff(ctx, np_array):
+  res_g = cl.Buffer(ctx.cl_ctx, cl.mem_flags.WRITE_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=np_array)
+  res_g.shape = np_array.shape
+  res_g.dtype = np_array.dtype
   return res_g
+
+def buffer_zeros(ctx, shape):
+  return buff(ctx, np.zeros(shape, dtype=np.float32))
 
 def buffer_like(ctx, x):
   return buffer_new(ctx, x.shape)
@@ -24,8 +27,8 @@ def clbuild(cl_ctx, prg):
 
 def uint2(x, y):
   return np.array((x,y), dtype=cl.cltypes.uint2)
-def i32(x):
-  return np.int32(x)
+
+i32 = np.int32
 
 def cl_subsample_krnl_build(cl_ctx, iter_op, result_op, decls=''):
   prg = """
@@ -83,34 +86,33 @@ def supersample_op(ctx, input, out_shape, kernel_size, result_op, decls='', inpu
   return ret
 
 def binary_op(ctx, code, x, y):
-  # TODO: Make broadcasting work when it's not at the most inner part of the arrays.
-  def get_xdiv(xs, ys):
-    if len(xs) != len(ys):
-      return None
-    r = 1
-    for i in range(len(xs)):
-      if (xs[i] != 1) and (r > 1 or (xs[i] != ys[i])):
-        return None
-      r *= ys[i] / xs[i]
-    return r
-  if y.shape == (1,):
-    xdiv, ydiv=1, np.prod(x.shape)
-  else:
-    xdiv, ydiv=1, get_xdiv(y.shape, x.shape)
-    if ydiv is None:
-      xdiv, ydiv=get_xdiv(y.shape, x.shape), 1
-      if xdiv is None:
-        raise Exception("shape mismatch in binop %s: %r %r" % (code, x.shape, y.shape))
-  ret = buffer_like(ctx, x if np.prod(x.shape) >= np.prod(y.shape) else y)
+  n_dims = max(len(x.shape), len(y.shape))
+  shape_x, shape_y = np.ones(n_dims, dtype=np.int32), np.ones(n_dims, dtype=np.int32)
+  shape_x[:len(x.shape)] = np.array(x.shape, dtype=np.int32)
+  shape_y[:len(y.shape)] = np.array(y.shape, dtype=np.int32)
+  if not np.all((shape_x == 1) | (shape_y == 1) | (shape_x == shape_y)):
+    raise Exception(f"binary op unbroadcastable shape mismatch: {x.shape} vs {y.shape}")
+  shape_ret = np.maximum(shape_x, shape_y)
+  ret = buffer_zeros(ctx, shape_ret)
+
   prg = clbuild(ctx.cl_ctx, """
-  __kernel void binop(__global const float *a_g, __global const float *b_g, __global float *res_g,
-                      int xdiv, int ydiv) {
+  __kernel void binop(__global const float *a_g, __global const float *b_g, __global float *res_g, int n_dims, int prod,
+          __global const int *shape_x, __global const int *shape_y, __global const int *shape_ret) {
+    // invariant: prod should contain the product of all dimensions (of the returned tensor) that we haven't handled yet
     int gid = get_global_id(0);
-    float a = a_g[gid/xdiv];
-    float b = b_g[gid/ydiv];
+    int idx_a = 0, idx_b = 0;
+    for (int dim = 0; dim < n_dims; dim++) {
+      prod /= shape_ret[dim];                       // mark current dimension as handled
+      int idx_ret = (gid / prod) % shape_ret[dim];  // the index into the current dimension (for the returned tensor)
+      idx_a = (idx_a * shape_x[dim]) + (idx_ret % shape_x[dim]); // does nothing if shape_x[dim] is 1
+      idx_b = (idx_b * shape_y[dim]) + (idx_ret % shape_y[dim]); // does nothing if shape_y[dim] is 1
+    }
+    float a = a_g[idx_a];
+    float b = b_g[idx_b];
     res_g[gid] = """+code+""";
   }""")
-  prg.binop(ctx.cl_queue, [np.prod(ret.shape)], None, x, y, ret, i32(xdiv), i32(ydiv))
+  prod = i32(shape_ret.prod())
+  prg.binop(ctx.cl_queue, [prod], None, x, y, ret, i32(n_dims), prod, buff(ctx, shape_x), buff(ctx, shape_y), buff(ctx, shape_ret))
   return ret
 
 def unary_op(ctx, code, x):
@@ -312,19 +314,13 @@ class Reshape(Function):
   @staticmethod
   def forward(ctx, x, shape):
     ctx.save_for_backward(x.shape)
-    ss = list(shape)
 
     # I'm sorry for this code
-    tsum = 1
-    for s in ss:
-      if s != -1:
-        tsum *= s
-    for i,s in enumerate(ss):
-      if s == -1:
-        ss[i] = np.prod(x.shape) // tsum
-    assert np.prod(x.shape) == np.prod(ss)
+    tsum = functools.reduce(lambda x,y: x*y, (s for s in shape if s != -1), 1)
+    shape = tuple(np.prod(x.shape) // tsum if s == -1 else s for s in shape)
+    assert np.prod(x.shape) == np.prod(shape)
     x = unary_op(ctx, 'a', x)
-    x.shape = tuple(ss)
+    x.shape = shape
     return x
 
   @staticmethod
